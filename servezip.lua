@@ -38,7 +38,9 @@ local lfs = require('lfs')
 local path = require('pl.path')
 local dir = require('pl.dir')
 local stringx = require('pl.stringx')
+local restylock = require('resty.lock')
 
+local BUFLEN = 4096
 function getrange(rangehdr, filesize)
   if not rangehdr then
     ngx.header['Accept-Ranges']='bytes'
@@ -79,8 +81,12 @@ local dest_file = path.join(dest_dir, path.basename(zip_path))
 
 local fx, data, ofStart, ofEnd, useRange
 
+local lock = restylock:new('servezip.lock', {exptime=60, timeout=20})
+
 -- check existing file on cache; with redirect on, this should never executed
 if path.isfile(dest_file) then
+  
+  local ok, _ = lock:lock(dest_file)
   ofStart, ofEnd, useRange = getrange(ngx.req.get_headers()['Range'], path.getsize(dest_file))
 
   local attr = lfs.attributes(dest_file)
@@ -95,8 +101,8 @@ if path.isfile(dest_file) then
 
   local szRead
   repeat
-    szRead = 4096
-    if ofStart + 4096 - 1 > ofEnd then
+    szRead = BUFLEN
+    if ofStart + BUFLEN - 1 > ofEnd then
       szRead = ofEnd - ofStart + 1
     end
     data = fx:read(szRead)
@@ -107,6 +113,7 @@ if path.isfile(dest_file) then
     ofStart = ofStart + szRead
   until ofStart >= ofEnd
   fx:close()
+  ok, _ = lock:unlock()
   ngx.exit(ngx.HTTP_OK)
 end
 
@@ -129,6 +136,7 @@ if not path.exists(dest_dir) then
   dir.makepath(dest_dir)
 end
 
+local ok, _ = lock:lock(dest_file)
 fx = io.open(dest_file,'w')
 
 -- redirect don't need any output from lua
@@ -136,14 +144,17 @@ if not redirect then
   ofStart, ofEnd, useRange = getrange(ngx.req.get_headers()['Range'], stat.size)
   ngx.header['Last-Modified'] = ngx.http_time(stat.mtime)
   ngx.header['Content-Length'] = ofEnd - ofStart + 1
+  if useRange then
+    ngx.status = 206 -- Partial content
+  end
 end
 
 local ofCurr = 0
 local beginOut, endOut = false, false
 local szRead, pStart, pEnd
 repeat
-  szRead = 4096
-  if ofCurr + 4096 - 1 > stat.size then
+  szRead = BUFLEN
+  if ofCurr + BUFLEN - 1 > stat.size then
     szRead = stat.size - ofCurr + 1
   end
   --ngx.log(ngx.ERR, string.format("fileSize, ofStart, ofCurr, ofEnd, szRead : %d, %d, %d, %d, %d", stat.size, ofStart, ofCurr, ofEnd, szRead))
@@ -178,7 +189,9 @@ zfile:close()
 
 fx:close()
 lfs.touch(dest_file, stat.mtime, stat.mtime)
+local ok, _ = lock:unlock()
 
 if redirect then
   ngx.exec(ngx.var.request_uri)
 end
+--ngx.log(ngx.ERR, "DONE")
