@@ -1,7 +1,7 @@
 --[[
   OpenResty apps : Serving static contents from Zip file
 
-  Depends on luarocks, luazip, penlight
+  Depends on luarocks, lua-zip, penlight
 
   Inputs:
     zip_file => path to zip file
@@ -33,15 +33,43 @@
 		try_files $uri @zip_server;
 	}
 --]]
-
---[[function getrange(rangehdr, filesize)
-  return 1
-end--]]
-
-local zip = require('zip')
+local zip = require('brimworks.zip')
+local lfs = require('lfs')
 local path = require('pl.path')
 local dir = require('pl.dir')
 local stringx = require('pl.stringx')
+
+function getrange(rangehdr, filesize)
+  if not rangehdr then
+    ngx.header['Accept-Ranges']='bytes'
+    return 0, filesize-1, false
+  end
+
+  local val = stringx.split(stringx.split(rangehdr,'=')[2],'-')
+  local ofStart, ofEnd = tonumber(val[1]),tonumber(val[2])
+
+  if not ofStart then
+    -- ex:bytes=-10
+    ofStart = filesize - ofEnd
+    ofEnd = filesize - 1
+  elseif not ofEnd then
+    -- ex:bytes=39-
+    ofEnd = filesize - 1
+  end
+
+  if ofEnd >= filesize then
+    ofEnd = filesize - 1
+  end
+
+  if ofStart > ofEnd then
+    ngx.header['Content-Range'] = 'bytes */'..filesize
+    ngx.exit(416)
+  end 
+
+  ngx.header['Content-Range'] = 'bytes '.. ofStart ..'-'.. ofEnd ..'/'..filesize
+  return ofStart, ofEnd, true 
+end
+
 local zip_file, zip_cachedir, zip_path = ngx.var.zip_file, ngx.var.zip_cachedir, ngx.var.zip_path
 local redirect = ngx.var.zip_redirect == 'on'
 
@@ -49,17 +77,36 @@ local _, _, uri2dir = string.find(ngx.var.uri, '/(.+)/' .. zip_path)
 local dest_dir = path.join(zip_cachedir, uri2dir, path.dirname(zip_path))
 local dest_file = path.join(dest_dir, path.basename(zip_path))
 
-local fx, data, ofstart, ofend
+local fx, data, ofStart, ofEnd, useRange
+
 -- check existing file on cache; with redirect on, this should never executed
 if path.isfile(dest_file) then
+  ofStart, ofEnd, useRange = getrange(ngx.req.get_headers()['Range'], path.getsize(dest_file))
+
+  local attr = lfs.attributes(dest_file)
+  ngx.header['Content-Length'] = ofEnd - ofStart + 1
+  ngx.header['Last-Modified'] = ngx.http_time(attr.modification)
+  if useRange then
+    ngx.status = 206 -- Partial content
+  end
+
   fx = io.open(dest_file,"r")
+  fx:seek('set', ofStart)
+
+  local szRead
   repeat
-    data = fx:read(4096)
+    szRead = 4096
+    if ofStart + 4096 - 1 > ofEnd then
+      szRead = ofEnd - ofStart + 1
+    end
+    data = fx:read(szRead)
     if data then
       ngx.print(data)
       ngx.flush(true)
     end
-  until data == nil
+    ofStart = ofStart + szRead
+  until ofStart >= ofEnd
+  fx:close()
   ngx.exit(ngx.HTTP_OK)
 end
 
@@ -75,26 +122,62 @@ if err then
   ngx.exit(ngx.HTTP_NOT_FOUND)
 end
 
+local stat = zfile:stat(zip_path)
+
+-- prepare file cache
 if not path.exists(dest_dir) then
   dir.makepath(dest_dir)
 end
 
 fx = io.open(dest_file,'w')
 
+-- redirect don't need any output from lua
+if not redirect then
+  ofStart, ofEnd, useRange = getrange(ngx.req.get_headers()['Range'], stat.size)
+  ngx.header['Last-Modified'] = ngx.http_time(stat.mtime)
+  ngx.header['Content-Length'] = ofEnd - ofStart + 1
+end
+
+local ofCurr = 0
+local beginOut, endOut = false, false
+local szRead, pStart, pEnd
 repeat
-  data = fi:read(4096)
+  szRead = 4096
+  if ofCurr + 4096 - 1 > stat.size then
+    szRead = stat.size - ofCurr + 1
+  end
+  --ngx.log(ngx.ERR, string.format("fileSize, ofStart, ofCurr, ofEnd, szRead : %d, %d, %d, %d, %d", stat.size, ofStart, ofCurr, ofEnd, szRead))
+  data = fi:read(szRead)
   if data then 
     fx:write(data)
-    if not redirect then
-      ngx.print(data)
-      ngx.flush(true)
-    end
-  end
-until data == nil
 
+    -- return portion of data for range request, while writing data to file cache
+    if not redirect and not endOut then
+      pStart = 0
+      if not beginOut and ofCurr + szRead > ofStart then
+        beginOut = true
+        pStart = ofStart - ofCurr 
+      end
+      if beginOut then
+        if ofCurr + szRead - 1 > ofEnd then
+	  pEnd = ofEnd - ofCurr
+          endOut = true
+        else
+          pEnd = szRead - 1
+        end
+        ngx.print(string.sub(data, pStart+1, pEnd+1))
+        ngx.flush(true)
+      end
+    end
+
+  end
+  ofCurr = ofCurr + szRead
+until ofCurr >= stat.size
 fi:close()
 zfile:close()
+
 fx:close()
+lfs.touch(dest_file, stat.mtime, stat.mtime)
 
 if redirect then
   ngx.exec(ngx.var.request_uri)
