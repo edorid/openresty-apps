@@ -75,7 +75,7 @@ end
 local zip_file, zip_cachedir, zip_path = ngx.var.zip_file, ngx.var.zip_cachedir, ngx.var.zip_path
 local redirect = ngx.var.zip_redirect == 'on'
 
-local _, _, uri2dir = string.find(ngx.var.uri, '/(.+)/' .. zip_path)
+local uri2dir = string.sub(stringx.replace(ngx.var.uri, zip_path, ''), 2)
 local dest_dir = path.join(zip_cachedir, uri2dir, path.dirname(zip_path))
 local dest_file = path.join(dest_dir, path.basename(zip_path))
 
